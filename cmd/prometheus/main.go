@@ -15,10 +15,8 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
-	"net/http"
 	_ "net/http/pprof" // Comment this line to disable pprof endpoint.
 	"os"
 	"os/signal"
@@ -26,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/emicklei/go-restful"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
@@ -70,169 +67,6 @@ var (
 
 func init() {
 	prometheus.MustRegister(version.NewCollector("prometheus"))
-
-	//Molen
-	ws := new(restful.WebService)
-	ws.
-		Path("/promcfgreload").
-		Consumes(restful.MIME_XML, restful.MIME_JSON).
-		Produces(restful.MIME_JSON, restful.MIME_XML)
-
-	ws.Route(ws.POST("/").To(promCfgReload).
-		Doc("reload prometheus config").
-		Operation("promCfgReload"))
-
-	restful.Add(ws)
-}
-func promCfgForGlobal(pCfg *promCfg) error {
-	//全局配置
-	fout, err := os.Create("/etc/newprometheus.yaml")
-	if err != nil {
-		fmt.Println("配置文件打开出错:", err)
-		return err
-	}
-	defer fout.Close()
-
-	cfgContent := fmt.Sprintf(`global:
-  scrape_interval: %s
-  scrape_timeout: %s
-  evaluation_interval: %s
-scrape_configs:`, pCfg.ScrapeInterval, pCfg.ScrapeTimeout, pCfg.EvaluationInterval)
-	fout.WriteString(cfgContent)
-	return nil
-}
-
-func promCfgForK8s(pCfg *promCfg) error {
-
-	if len(pCfg.DataSourceFromK8s) != 0 {
-		err := errors.New("DataSource not found")
-		fmt.Println(err)
-		return err
-	}
-	for k := range pCfg.DataSourceFromK8s {
-		fout, err := os.OpenFile("/etc/newprometheus.yaml", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
-		if err != nil {
-			fmt.Println("config file not exist:", err)
-			return err
-		}
-		var cfgContentAppend string
-		//抓取k8s集群节点信息
-		if pCfg.DataSourceFromK8s[k].Role == "node" {
-			cfgContentAppend = fmt.Sprintf(`- job_name: %s
-  kubernetes_sd_configs:
-  - role: %s
-    api_servers:
-    - %s
-  relabel_configs:
-  - action: labelmap
-    regex: __meta_kubernetes_node_label_(.+)
-  - source_labels: [__address__]
-	regex: '(.*):10250'
-	replacement: '${1}:9100'
-	target_label: __address__
-  - source_labels: [__meta_kubernetes_node_address_InternalIP]
-    action: replace
-	target_label: internalIP`, pCfg.DataSourceFromK8s[k].Role, pCfg.DataSourceFromK8s[k].K8sMasterHost)
-
-		}
-		//抓取k8s集群各个容器的信息
-		if pCfg.DataSourceFromK8s[k].Role == "container" { //源码中严格意义上并没有containe 的 role
-			cfgContentAppend = fmt.Sprintf(`- job_name: %s
-  kubernetes_sd_configs:
-  - role: node
-    api_servers:
-	- %s
-  relabel_configs:
-  - source_labels: [__meta_kubernetes_node_address_InternalIP]
-    action: replace
-	target_label: nodeIP
-  - source_labels: [__meta_kubernetes_node_label_kubernetes_io_hostname]
-    action: replace
-	target_label: nodeName
-  - source_labels: [__address__]
-    regex: '(.*):10250'
-	replacement: '${1}:10255
-	target_label: __address__'`, pCfg.DataSourceFromK8s[k].K8sMasterHost)
-
-		}
-		fout.WriteString("\n")
-		fout.WriteString(cfgContentAppend)
-	}
-	return nil
-}
-
-func promCfgForOthers(pCfg *promCfg) error {
-
-	if len(pCfg.DataSourceFromOthers) != 0 {
-		err := errors.New("DataSource not found")
-		fmt.Println(err)
-		return err
-	}
-
-	for k := range pCfg.DataSourceFromOthers {
-		fout, err := os.OpenFile("/etc/newprometheus.yaml", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
-		if err != nil {
-			fmt.Println("config file not exist:", err)
-			return err
-		}
-		cfgContentAppend := fmt.Sprintf(`- job_name: %s
-static_configs:
-  - targets: [%s]`, pCfg.DataSourceFromOthers[k].JobName, pCfg.DataSourceFromOthers[k].ScrapeAddress)
-		fout.WriteString("\n")
-		fout.WriteString(cfgContentAppend)
-	}
-	return nil
-}
-
-//Molen
-func promCfgReload(request *restful.Request, response *restful.Response) {
-	fmt.Println("界面开始重置prometheus 配置文件！！！！")
-
-	pCfg := promCfg{}
-	if err := request.ReadEntity(pCfg); err != nil {
-		response.WriteError(http.StatusInternalServerError, err)
-		return
-	}
-
-	//全局配置
-	if err := promCfgForGlobal(&pCfg); err != nil {
-		response.WriteErrorString(http.StatusInternalServerError, "failed to create config file")
-		return
-	}
-
-	//关于其他监控对象的配置操作
-	if err := promCfgForOthers(&pCfg); err != nil {
-		response.WriteErrorString(http.StatusInternalServerError, "failed to create config file")
-		return
-	}
-
-	//关于监控k8s的配置操作
-	if err := promCfgForK8s(&pCfg); err != nil {
-		response.WriteErrorString(http.StatusInternalServerError, "failed to create config file")
-		return
-	}
-
-}
-
-//Molen: 主要是定义界面需要配置的数据参数
-type promCfg struct {
-	ScrapeInterval       string             `json:"scrape_interval,omitempty"` //采集数据的频率 默认20s
-	ScrapeTimeout        string             `json:"scrape_timeout"`            //数据抓取超时时间	默认10s
-	EvaluationInterval   string             `json:"evaluation_interval"`       //规则计算频率	默认20s
-	DataSourceFromK8s    []KubernetesTarget `json:"data_source_from_kubernetes,omitempty"`
-	DataSourceFromOthers []OtherTarget      `json:"data_source_from_others,omitempty"`
-}
-
-type KubernetesTarget struct {
-	JobName       string `json:"job_name"`
-	K8sMasterHost string `json:"kubernetes_master_host"` //k8s master address
-	Role          string `json:"role"`
-	//TargetPort    string `yaml:"target_port"` //抓取数据指标的监听端口 只显示 不可配, 回复node_container:10255;node:9100
-}
-
-type OtherTarget struct {
-	JobName       string `json:"job_name"`
-	ScrapeAddress string `json:"scrape_address"` //数据抓取的地址，例如：172.16.13.111:30921
 }
 
 // Main manages the startup and shutdown lifecycle of the entire Prometheus server.
@@ -320,6 +154,16 @@ func Main() int {
 
 	webHandler := web.New(&cfg.web)
 
+	//保存启动时的配置文件
+	web.CFile = cfg.configFile
+
+	//将启动参数中的alertmanager.url保存 供BCMProm与alert通信使用
+	iCfg := web.InitCfg{}
+	for alertManagerURL := range cfg.alertmanagerURLs {
+		iCfg.AlertManagerURL = alertManagerURL
+		web.SetInitCfg(iCfg)
+	}
+
 	reloadables = append(reloadables, targetManager, ruleManager, webHandler, notifier)
 
 	if err := reloadConfig(cfg.configFile, reloadables...); err != nil {
@@ -358,15 +202,16 @@ func Main() int {
 		for {
 			chanData, ok := <-web.PromReloadChan
 			if !ok {
+				log.Infoln("Molen_channel is closed")
 				return
 			}
-			fmt.Println("Molen_receive an channel signal:", chanData)
-			reloadConfig("/etc/newprometheus.yaml", reloadables...)
+			log.Infoln("Molen_receive an channel signal:", chanData)
+			reloadConfig(cfg.configFile, reloadables...)
 		}
 
 	}()
-	// Start all components. The order is NOT arbitrary.
 
+	// Start all components. The order is NOT arbitrary.
 	if err := localStorage.Start(); err != nil {
 		log.Errorln("Error opening memory series storage:", err)
 		return 1
