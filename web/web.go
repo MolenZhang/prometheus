@@ -27,6 +27,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,7 +60,10 @@ import (
 var localhostRepresentations = []string{"127.0.0.1", "localhost"}
 
 //保存上线的配置文件信息
-var CFile string
+var (
+	CFile      string
+	MsgSendBtn bool
+)
 
 // Handler serves various HTTP endpoints of the Prometheus server
 type Handler struct {
@@ -455,9 +459,11 @@ const (
 	nodeDisk   string = "nodeDisk"   //集群节点磁盘空间
 	nodeMemory string = "nodeMemory" //集群节点内存
 
-	alertRules           string = "alert.rules" //规则文件
-	k8sCluster           string = "k8sCluster"
-	reload               string = "/-/reload"
+	message    string = "message" //短信
+	k8sCluster string = "k8sCluster"
+	reload     string = "/-/reload"
+
+	alertRules           string = "alert.rules"          //规则文件
 	preLocation          string = "/etc/palert/"         //保存prometheus规则文件的路径
 	prometheusCfg        string = "/etc/prometheus.yaml" //prometheus服务配置文件
 	clusterAlertReceiver string = "clusterAlertRec"      //集群报警信息接收者
@@ -497,14 +503,14 @@ func (h *Handler) creAlertForBCM(w http.ResponseWriter, r *http.Request) {
 	log.Infoln("BCM 启动监控对象配置....")
 
 	var alertTargets = struct {
-		AlertJob          []string          `json:"alertJob"`                  //监控对象
-		AlertSendType     map[string]string `json:"alertSendType"`             //报警发送方式
-		Namespace         string            `json:"namespace"`                 //租户
-		SvcName           string            `json:"svcName"`                   //服务
-		Receiver          string            `json:"receiver"`                  //接收者
-		AlertDurationTime string            `json:"alertDurationTime"`         //报警触发持续时间
-		CPUThreshold      string            `json:"cpuThreshold,omitempty"`    //CPU配置
-		MemoryThreshold   string            `json:"memoryThreshold,omitempty"` //Memory配置
+		AlertJob      []string          `json:"alertJob"`      //监控对象
+		AlertSendType map[string]string `json:"alertSendType"` //报警发送方式
+		Namespace     string            `json:"namespace"`     //租户
+		SvcName       string            `json:"svcName"`       //服务
+		Receiver      string            `json:"receiver"`      //接收者
+		//AlertDurationTime string            `json:"alertDurationTime"`         //报警触发持续时间
+		CPUThreshold    string `json:"cpuThreshold,omitempty"`    //CPU配置
+		MemoryThreshold string `json:"memoryThreshold,omitempty"` //Memory配置
 	}{}
 
 	var resp respMsg
@@ -518,6 +524,15 @@ func (h *Handler) creAlertForBCM(w http.ResponseWriter, r *http.Request) {
 
 	log.Infoln("解析BCM传来的数据为:", alertTargets)
 
+	if false == MsgSendBtn {
+		for sendType, _ := range alertTargets.AlertSendType {
+			if sendType == message {
+				resp.respFail(w, "该环境不支持短信发送告警")
+				return
+			}
+		}
+	}
+
 	//保存租户和服务的对应关系
 	addSvcReceiverToMap(alertTargets.SvcName, alertTargets.Receiver)
 
@@ -528,21 +543,19 @@ func (h *Handler) creAlertForBCM(w http.ResponseWriter, r *http.Request) {
 		switch target {
 		case cpu:
 			if result := writeCPUCfgToFile(alertTargets.Namespace, alertTargets.SvcName,
-				alertTargets.Receiver, alertTargets.CPUThreshold,
-				alertTargets.AlertDurationTime); result != "" {
+				alertTargets.Receiver, alertTargets.CPUThreshold); result != "" {
 				resp.respFail(w, result)
 				return
 			}
 		case memory:
 			if result := writeMemoryCfgToFile(alertTargets.Namespace, alertTargets.SvcName,
-				alertTargets.Receiver, alertTargets.MemoryThreshold,
-				alertTargets.AlertDurationTime); result != "" {
+				alertTargets.Receiver, alertTargets.MemoryThreshold); result != "" {
 				resp.respFail(w, result)
 				return
 			}
 		default:
 			if result := writeSvcStatusToFile(alertTargets.Namespace, alertTargets.SvcName,
-				alertTargets.Receiver, alertTargets.AlertDurationTime); result != "" {
+				alertTargets.Receiver); result != "" {
 				resp.respFail(w, result)
 				return
 			}
@@ -586,6 +599,11 @@ type respInfo struct {
 
 // 与alertmanager通信
 func sendMsgToAlert(alertType map[string]string, receiver, preLabel string) {
+
+	if strings.Contains(preLabel, "-") {
+		preLabel = strings.Replace(preLabel, "-", "_", -1)
+	}
+
 	var (
 		req  Request
 		resp respInfo
@@ -598,6 +616,7 @@ func sendMsgToAlert(alertType map[string]string, receiver, preLabel string) {
 
 	recInfo.AlertType = make(map[string]string, 0)
 	recInfo.LabelInfo.Match = make(map[string]string, 0)
+
 	recInfo.AlertType = alertType
 	recInfo.LabelInfo = recLabel{
 		Match: map[string]string{
@@ -669,7 +688,7 @@ func addRuleFiles(fileName string) string {
 }
 
 // 关于CPU的报警规则文件
-func writeCPUCfgToFile(ns, svc, receiver, threshold, duration string) string {
+func writeCPUCfgToFile(ns, svc, receiver, threshold string) string {
 	rulesDir := preLocation + ns + "/"
 	rulesFileName := svc + "_" + cpu + "_" + alertRules
 
@@ -696,18 +715,31 @@ func writeCPUCfgToFile(ns, svc, receiver, threshold, duration string) string {
 	log.Infoln("替换后的租户和服务信息是：", repNs, repSvc)
 
 	rulesContent := fmt.Sprintf(`ALERT %s_%s_CPUUsageHigh
-  IF sum(rate(container_cpu_usage_seconds_total { namespace =~ "%s.*",pod_name =~ "%s.*",container_name =~ "%s.*"}[5m])) BY (instance) / sum(machine_cpu_cores) BY (instance) > %s
-  FOR %s
+  IF sum(rate(container_cpu_usage_seconds_total { namespace =~ "%s.*",pod_name =~ "%s.*",container_name = "%s"}[5m])) / count(node_cpu{mode="system"}) > %s
+  FOR 5m
   LABELS {
 	%s_receiver = "%s"
   }
   ANNOTATIONS {
-	summary = "服务 %s CPU使用率较高"
+	description = "服务 %s CPU使用率超过 %s",
+	summary = "服务 %s CPU 使用率较高"
   }
-`, repNs, repSvc, ns, svc, svc, threshold, duration, svc, receiver, svc, svc)
+`, repNs, repSvc, ns, svc, svc, threshold, svc, receiver, svc, threshold, svc)
 
 	f.WriteString(rulesContent)
 	return ""
+}
+
+//转换百分数
+func traToPercent(num string) (bool, string) {
+
+	intNum, _ := strconv.Atoi(num)
+	if intNum >= 0 && intNum <= 1 {
+
+		return true, strconv.Itoa(intNum * 100)
+	}
+
+	return false, "请输入一个0~1之间的小数"
 }
 
 func strReplace(ns, svc string) (repNs string, repSvc string) {
@@ -799,7 +831,7 @@ func (h *Handler) addExternExporter(w http.ResponseWriter, r *http.Request) {
 }
 
 // 关于MEMORY的报警规则文件
-func writeMemoryCfgToFile(ns, svc, receiver, threshold, duration string) string {
+func writeMemoryCfgToFile(ns, svc, receiver, threshold string) string {
 
 	rulesDir := preLocation + ns + "/"
 	rulesFileName := svc + "_" + memory + "_" + alertRules
@@ -824,23 +856,27 @@ func writeMemoryCfgToFile(ns, svc, receiver, threshold, duration string) string 
 	//规则文件不支持标识符"-"
 	repNs, repSvc := strReplace(ns, svc)
 
+	intThr, _ := strconv.Atoi(threshold)
+	intThr = intThr * 1000000000 //1G
+
 	rulesContent := fmt.Sprintf(`ALERT %s_%s_MemoryUsageHigh
-  IF sum(container_memory_usage_bytes{container_name=~"%s.*",pod_name=~"%s.*",namespace="%s"}) > %s
-  FOR %s
+  IF sum(container_memory_usage_bytes{namespace="%s",container_name="%s",pod_name=~"%s.*"}) > %s
+  FOR 5m
   LABELS {
 	%s_receiver = "%s"
   }
   ANNOTATIONS {
-	summary = "服务 %s 的容器 内存使用过高"
+	description = "服务 %s 的内存使用率超过 %s",
+	summary = "服务 %s 的内存使用率过高"
   }
-`, repNs, repSvc, svc, svc, ns, threshold, duration, svc, receiver, svc, svc)
+`, repNs, repSvc, ns, svc, svc, intThr, svc, receiver, svc, threshold, svc)
 
 	f.WriteString(rulesContent)
 	return ""
 }
 
 // 关于服务状态的报警规则文件
-func writeSvcStatusToFile(ns, svc, receiver, duration string) string {
+func writeSvcStatusToFile(ns, svc, receiver string) string {
 
 	rulesDir := preLocation + ns + "/"
 	rulesFileName := svc + "_" + svcStatus + "_" + alertRules
@@ -866,30 +902,38 @@ func writeSvcStatusToFile(ns, svc, receiver, duration string) string {
 	repNs, repSvc := strReplace(ns, svc)
 
 	rulesContent := fmt.Sprintf(`ALERT %s_%s_Down
-  IF sum(kube_pod_container_status_terminated{ pod =~ "%s.*",container =~ "%s.*"}) > 0
-  FOR %s
+  IF absent(container_memory_usage_bytes{ namespace = "%s",pod_name =~ "%s.*",container_name = "%s"})
+  FOR 5m
   LABELS {
 	%s_receiver = "%s"
   }
   ANNOTATIONS {
-    description = "服务 {{ $labels.service }} 宕机",
-	summary = "服务 {{ $labels.service }} 下的实例 {{ $labels.pod }}  已宕机超过5分钟 "
+    description = "服务 %s 宕机",
+	summary = " 租户 %s 下的服务 %s 已宕机超过 %s 分钟 "
   }
 
-ALERT %s_%s_PodRestartingTooMuch
-  IF rate(kube_pod_container_status_restarts{pod=~"%s",service_name="%s"}[1m]) > 1/(5 * 60) 
-  FOR %s
+ALERT %s_%s_PodRestarted
+  IF kube_pod_container_status_restarts{namespace = "%s",pod =~"%s.*",container = "%s"} > 0 
+  FOR 5m
   LABELS {
-    receiver = "%s"
+    %s_receiver = "%s"
   }
   ANNOTATIONS {
-	summary = "租户 {{ $labels.namespace}} 下的 {{ $label.pod }} 多次重启.",
-	description = "租户 {{ $labels.namespace }} 下的 {{$label.pod}} 多次重启."
+	summary = "服务 %s 发生重启",
+	description = "租户 %s 下的服务 %s 发生重启事件"
   }
-`, repNs, repSvc, svc, svc, duration, receiver, repNs, repSvc, svc, svc, duration, receiver)
+`, repNs, repSvc, ns, svc, svc, repSvc, receiver, svc, ns, svc, repNs, repSvc, ns, svc, svc, duration, repSvc, receiver, svc, ns, svc)
 
 	f.WriteString(rulesContent)
 	return ""
+}
+
+func threConvToInt(cThre, mThre string) (CPUThre int, memThre int) {
+
+	CPUThre, _ = strconv.Atoi(cThre)
+	memThre, _ = strconv.Atoi(mThre)
+
+	return
 }
 
 func (h *Handler) updAlertForBCM(w http.ResponseWriter, r *http.Request) {
@@ -1156,12 +1200,12 @@ func (h *Handler) creNodesInfo(w http.ResponseWriter, r *http.Request) {
 
 	var resp respMsg
 	var alertTargets = struct {
-		AlertJob          []string          `json:"alertJob"`                  //监控对象 包括 cpu memory disk
-		AlertSendType     map[string]string `json:"alertSendType"`             //报警发送方式
-		Receiver          string            `json:"receiver"`                  //接收者
-		AlertDurationTime string            `json:"alertDurationTime"`         //报警触发持续时间,默认5m
-		CPUThreshold      string            `json:"cpuThreshold,omitempty"`    //CPU阈值,根据监控对象填写
-		MemoryThreshold   string            `json:"memoryThreshold,omitempty"` //Memory阈值,根据监控对象填写
+		AlertJob      []string          `json:"alertJob"`      //监控对象 包括 cpu memory disk
+		AlertSendType map[string]string `json:"alertSendType"` //报警发送方式
+		Receiver      string            `json:"receiver"`      //接收者
+		//AlertDurationTime string            `json:"alertDurationTime"`         //报警触发持续时间,默认5m
+		CPUThreshold    string `json:"cpuThreshold,omitempty"`    //CPU阈值,根据监控对象填写
+		MemoryThreshold string `json:"memoryThreshold,omitempty"` //Memory阈值,根据监控对象填写
 	}{}
 
 	data, err := ioutil.ReadAll(r.Body)
@@ -1170,23 +1214,37 @@ func (h *Handler) creNodesInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	json.Unmarshal(data, &alertTargets)
 
+	//阈值限定0~1
+	CPUThre, memThre := threConvToInt(alertTargets.CPUThreshold, alertTargets.MemoryThreshold)
+	if CPUThre > 1 || CPUThre < 0 {
+		resp.respFail(w, "CPU阈值为0~1之间的小数")
+
+		return
+	}
+
+	if memThre > 1 || memThre < 0 {
+		resp.respFail(w, "MEMORY阈值为0~1之间的小数")
+
+		return
+	}
+
 	//增加报警配置
 	for _, target := range alertTargets.AlertJob {
 		switch target {
 		case cpu:
-			if result := wNodeCPUCfg(alertTargets.AlertDurationTime,
+			if result := wNodeCPUCfg(
 				alertTargets.CPUThreshold, alertTargets.Receiver); result != "" {
 				resp.respFail(w, result)
 				return
 			}
 		case memory:
-			if result := wNodeMemoryCfg(alertTargets.AlertDurationTime,
+			if result := wNodeMemoryCfg(
 				alertTargets.MemoryThreshold, alertTargets.Receiver); result != "" {
 				resp.respFail(w, result)
 				return
 			}
 		default:
-			if result := wNodeDiskCfg(alertTargets.AlertDurationTime,
+			if result := wNodeDiskCfg(
 				alertTargets.Receiver); result != "" {
 				resp.respFail(w, result)
 				return
@@ -1205,7 +1263,7 @@ func (h *Handler) creNodesInfo(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func wNodeCPUCfg(duration, threshold, receiver string) string {
+func wNodeCPUCfg(threshold, receiver string) string {
 	rulesDir := preLocation + k8sCluster + "/"
 	rulesFileName := nodeCPU + "_" + alertRules
 
@@ -1227,22 +1285,22 @@ func wNodeCPUCfg(duration, threshold, receiver string) string {
 	defer f.Close()
 
 	rulesContent := fmt.Sprintf(`ALERT NodeCPUUsageHigh
-	IF ((sum(node_cpu{mode=~"user|nice|system|irq|softirq|steal|idle|iowait"})by(instance)) - (sum(node_cpu{mode=~"idle|iowait"})by(instance)))  / (sum(node_cpu{mode=~"user|nice|system|irq|softirq|steal|idle|iowait"})by(instance)) * 100 > %s
-  FOR %s
+	IF ((sum(node_cpu{mode=~"user|nice|system|irq|softirq|steal|idle|iowait"})by(instance)) - (sum(node_cpu{mode=~"idle|iowait"})by(instance)))  / (sum(node_cpu{mode=~"user|nice|system|irq|softirq|steal|idle|iowait"})by(instance))   > %s
+  FOR 5m
   LABELS {
 	%s_receiver = "%s"
   }
   ANNOTATIONS {
-    description = "主机{{ $instance }}  CPU使用值为： {{ $value }}",
-	summary = "主机 {{ $instance }} CPU使用率较高"
+    description = "主机{{ $labels.instance }}  CPU使用率超过 %s",
+	summary = "主机 {{ $labels.instance }} CPU使用率较高"
   }
-`, threshold, duration, k8sCluster, receiver)
+`, threshold, k8sCluster, receiver, threshold)
 
 	f.WriteString(rulesContent)
 	return ""
 }
 
-func wNodeMemoryCfg(duration, threshold, receiver string) string {
+func wNodeMemoryCfg(threshold, receiver string) string {
 	rulesDir := preLocation + k8sCluster + "/"
 	rulesFileName := nodeMemory + "_" + alertRules
 
@@ -1263,23 +1321,23 @@ func wNodeMemoryCfg(duration, threshold, receiver string) string {
 	defer f.Close()
 
 	rulesContent := fmt.Sprintf(`ALERT NodeMemoryUsageHigh
-	IF (sum(node_memory_MemTotal) - sum(node_memory_MemFree + node_memory_Buffers + node_memory_Cached) ) / sum(node_memory_MemTotal) * 100 > %s
-  FOR %s
+	IF (sum(node_memory_MemTotal)BY(instance) - sum(node_memory_MemFree + node_memory_Buffers + node_memory_Cached)BY(instance)) / sum(node_memory_MemTotal)BY(instance)  > %s
+  FOR 5m
   LABELS {
 	%s_receiver = "%s"
   }
   ANNOTATIONS {
-    description = "主机 {{ $instance }} 内存使用值为：{{$value}} ",
-	summary = "主机 {{ $instance }} 内存使用率较高"
+    description = "主机 {{ $labels.instance }} 内存使用率超过 %s ",
+	summary = "主机 {{ $labels.instance }} 内存使用率较高"
   }
-`, threshold, duration, k8sCluster, receiver)
+`, threshold, k8sCluster, receiver, threshold)
 
 	f.WriteString(rulesContent)
 	return ""
 
 }
 
-func wNodeDiskCfg(duration, receiver string) string {
+func wNodeDiskCfg(receiver string) string {
 	rulesDir := preLocation + k8sCluster + "/"
 	rulesFileName := nodeDisk + "_" + alertRules
 
@@ -1301,16 +1359,16 @@ func wNodeDiskCfg(duration, receiver string) string {
 	defer f.Close()
 
 	rulesContent := fmt.Sprintf(`ALERT NodeDiskWillFillIn4Hours
-  IF predict_linear(node_filesystem_free{job='node'}[1h], 4*3600) < 0
-  FOR %s
+  IF predict_linear(node_filesystem_free[1h], 4*3600) < 0
+  FOR 5m 
   LABELS {
 	%s_receiver = "%s"
   }
   ANNOTATIONS {
-    description = "主机 {{ $instance }} 磁盘剩余空间较少 }}",
-	summary = "主机 {{ $instance }} 磁盘剩余空间较少"
+    description = "主机 {{ $labels.instance }} 磁盘剩余空间较少 }}",
+	summary = "主机 {{ $labels.instance }} 磁盘剩余空间较少"
   }
-`, duration, k8sCluster, receiver)
+`, k8sCluster, receiver)
 
 	f.WriteString(rulesContent)
 	return ""
@@ -1340,12 +1398,12 @@ func (h *Handler) updNodesInfo(w http.ResponseWriter, r *http.Request) {
 
 	var resp respMsg
 	var alertTargets = struct {
-		AlertJob          []string          `json:"alertJob"`                  //监控对象 包括 cpu memory disk
-		AlertSendType     map[string]string `json:"alertSendType"`             //报警发送方式
-		Receiver          string            `json:"receiver"`                  //接收者
-		AlertDurationTime string            `json:"alertDurationTime"`         //报警触发持续时间,默认5m
-		CPUThreshold      string            `json:"cpuThreshold,omitempty"`    //CPU阈值,根据监控对象填写
-		MemoryThreshold   string            `json:"memoryThreshold,omitempty"` //Memory阈值,根据监控对象填写
+		AlertJob      []string          `json:"alertJob"`      //监控对象 包括 cpu memory disk
+		AlertSendType map[string]string `json:"alertSendType"` //报警发送方式
+		Receiver      string            `json:"receiver"`      //接收者
+		//AlertDurationTime string            `json:"alertDurationTime"`         //报警触发持续时间,默认5m
+		CPUThreshold    string `json:"cpuThreshold,omitempty"`    //CPU阈值,根据监控对象填写
+		MemoryThreshold string `json:"memoryThreshold,omitempty"` //Memory阈值,根据监控对象填写
 	}{}
 
 	data, err := ioutil.ReadAll(r.Body)
@@ -1353,6 +1411,20 @@ func (h *Handler) updNodesInfo(w http.ResponseWriter, r *http.Request) {
 		log.Errorln("解析BCM界面传参出错", err)
 	}
 	json.Unmarshal(data, &alertTargets)
+
+	//阈值限定0~1
+	CPUThre, memThre := threConvToInt(alertTargets.CPUThreshold, alertTargets.MemoryThreshold)
+	if CPUThre > 1 || CPUThre < 0 {
+		resp.respFail(w, "CPU阈值为0~1之间的小数")
+
+		return
+	}
+
+	if memThre > 1 || memThre < 0 {
+		resp.respFail(w, "MEMORY阈值为0~1之间的小数")
+
+		return
+	}
 
 	//删除旧配置，包括配置文件参数和规则文件
 	delNodesMonitorInfo()

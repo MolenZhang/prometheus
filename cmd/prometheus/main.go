@@ -157,6 +157,9 @@ func Main() int {
 	//保存启动时的配置文件
 	web.CFile = cfg.configFile
 
+	//保存启动时 是否支持短信告警的参数
+	web.MsgSendBtn = cfg.msgSendBtn
+
 	//将启动参数中的alertmanager.url保存 供BCMProm与alert通信使用
 	iCfg := web.InitCfg{}
 	for alertManagerURL := range cfg.alertmanagerURLs {

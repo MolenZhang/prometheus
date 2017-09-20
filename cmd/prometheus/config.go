@@ -43,6 +43,8 @@ import (
 var cfg = struct {
 	fs *flag.FlagSet
 
+	msgSendBtn bool //根据部署环境 确定是否支持短信接收告警功能
+
 	printVersion bool
 	configFile   string
 
@@ -96,6 +98,11 @@ func init() {
 
 	// Set additional defaults. //默认配置参数
 	cfg.storage.SyncStrategy = local.Adaptive
+
+	cfg.fs.BoolVar(
+		&cfg.msgSendBtn, "msgSendButton", true,
+		"if support the message alerit",
+	)
 
 	cfg.fs.BoolVar(
 		&cfg.printVersion, "version", false,
